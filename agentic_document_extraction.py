@@ -8,9 +8,12 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 
 from pydantic import BaseModel, Field
-from agents import Agent, Runner, function_tool, RunContextWrapper 
-from openai.types.responses import ResponseInputImageParam, ResponseInputTextParam
-from openai.types.responses.response_input_item_param import Message
+from env import load_env
+from providers import get_provider
+
+# Load environment from .env if present
+load_env()
+PROVIDER = get_provider()
 
 # =============== Models (PO) ===============
 class LineItem(BaseModel):
@@ -78,7 +81,7 @@ class NoopCtx:
     context: Dict[str, Any] = {}
     def __init__(self, **kwargs): self.context = dict(kwargs)
 
-def _notify(ctx: RunContextWrapper | None, message: str, **data):
+def _notify(ctx: Any | None, message: str, **data):
     try:
         cb = ctx.context.get("notify") if ctx else None
         (cb and callable(cb)) and cb({"message": message, **data})
@@ -280,19 +283,18 @@ async def _extract_po_window(
 ) -> PurchaseOrder:
     async with sem:
         _notify(ctx, "po_agent_start", page_range=f"{start_page_1b}-{end_page_1b}")
-        agent = Agent(
+        prompt = (
+            f"PageIndex: {start_page_1b}\n"
+            f"PageWindow: {start_page_1b}-{end_page_1b}\n\n"
+            f"TEXT:\n{window_text}"
+        )
+        po: PurchaseOrder = await PROVIDER.run_structured_text(
             name="PO Window Extractor",
             instructions=SYSTEM_PROMPT_PO,
             model=model,
             output_type=PurchaseOrder,
+            input_text=prompt,
         )
-        # IMPORTANT: keep PageIndex = first page so schema’s 'page' stays stable
-        res = await Runner.run(agent, input=(
-            f"PageIndex: {start_page_1b}\n"
-            f"PageWindow: {start_page_1b}-{end_page_1b}\n\n"
-            f"TEXT:\n{window_text}"
-        ))
-        po: PurchaseOrder = res.final_output
         if po.page is None:
             po.page = start_page_1b
         _notify(ctx, "po_agent_finish", page_range=f"{start_page_1b}-{end_page_1b}", lines=len(po.line_items or []))
@@ -335,14 +337,13 @@ def extract_text_from_pdf(pdf_bytes: bytes, tracer: Any, ctx: Any) -> str:
 async def _extract_po_one_page(page_idx: int, text: str, sem: asyncio.Semaphore, model: str, tracer: Any = None, ctx: Any = None) -> PurchaseOrder:
     async with sem:
         _notify(ctx, "po_agent_start", page=page_idx)
-        agent = Agent(
+        po: PurchaseOrder = await PROVIDER.run_structured_text(
             name="PO Page Extractor",
             instructions=SYSTEM_PROMPT_PO,
             model=model,
             output_type=PurchaseOrder,
+            input_text=f"PageIndex: {page_idx}\n\nTEXT:\n{text}",
         )
-        res = await Runner.run(agent, input=f"PageIndex: {page_idx}\n\nTEXT:\n{text}")
-        po: PurchaseOrder = res.final_output
         if po.page is None:
             po.page = page_idx
         _notify(ctx, "po_agent_finish", page=page_idx, lines=len(po.line_items or []))
@@ -440,29 +441,25 @@ async def po_from_text_pages(
 
 
 # =============== Vision (page-parallel with Agents) ===============
-async def _vision_one_page_markdown(img: Image.Image, page_idx: int, sem: asyncio.Semaphore, model: str, tracer: Any = None, ctx: Any = None) -> str:
+async def _vision_one_page_markdown(img: Image.Image, page_idx: int, sem: asyncio.Semaphore, model: str, tracer: Any = None, ctx: Any = None) -> VisionMarkdownOnly:
     async with sem:
         _notify(ctx, "vision_md_start", page=page_idx)
         # encode JPEG off the event loop
         loop = asyncio.get_running_loop()
         b64 = await loop.run_in_executor(ThreadPoolExecutor(max_workers=8), _to_base64_jpeg, img, 1400, 65)
-        agent = Agent(
+        md: VisionMarkdownOnly = await PROVIDER.run_structured_messages(
             name="Vision Markdown",
             instructions=VISION_PROMPT_MD,
             model=model,
             output_type=VisionMarkdownOnly,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": VISION_PROMPT_MD},
+                    {"type": "image", "image_url": f"data:image/jpeg;base64,{b64}", "detail": "low"},
+                ]
+            }]
         )
-        res = await Runner.run(agent, 
-                        input=[
-            Message(
-                content=[
-                    ResponseInputTextParam(text=VISION_PROMPT_MD, type="input_text"),
-                    ResponseInputImageParam(detail="low", image_url=f"data:image/jpeg;base64,{b64}", type="input_image")
-                ],
-                role="user"
-            )
-        ])
-        md: VisionMarkdownOnly = res.final_output
         _notify(ctx, "vision_md_finish", page=page_idx, chars=len(md.markdown))
         return md
 
@@ -471,23 +468,19 @@ async def _vision_one_page_combined(img: Image.Image, page_idx: int, sem: asynci
         _notify(ctx, "vision_json_start", page=page_idx)
         loop = asyncio.get_running_loop()
         b64 = await loop.run_in_executor(ThreadPoolExecutor(max_workers=8), _to_base64_jpeg, img, 1400, 65)
-        agent = Agent(
+        vc: VisionCombined = await PROVIDER.run_structured_messages(
             name="Vision Markdown+Chunks",
             instructions=VISION_PROMPT_COMBINED,
             model=model,
             output_type=VisionCombined,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": VISION_PROMPT_COMBINED},
+                    {"type": "image", "image_url": f"data:image/jpeg;base64,{b64}", "detail": "low"},
+                ]
+            }]
         )
-        res = await Runner.run(agent, 
-                        input=[
-            Message(
-                content=[
-                    ResponseInputTextParam(text=VISION_PROMPT_COMBINED, type="input_text"),
-                    ResponseInputImageParam(detail="low", image_url=f"data:image/jpeg;base64,{b64}", type="input_image")
-                ],
-                role="user"
-            )
-        ])
-        vc: VisionCombined = res.final_output
         
         for ch in vc.chunks:
             ch.page = page_idx - 1

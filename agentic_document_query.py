@@ -1,9 +1,14 @@
 from collections import defaultdict
 from pathlib import Path
-from agents import Agent, Runner
-from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Dict, Any, Literal, Optional
 import os, json
+
+from env import load_env
+from providers import get_provider
+load_env()
+PROVIDER = get_provider()
+
+from pydantic import BaseModel, Field, ConfigDict
 from collections import defaultdict
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageDraw, ImageFont
@@ -98,21 +103,19 @@ async def _run_qa_agent(question: str, chunks_json: str, model: str = "gpt-5-min
     """
     chunks_json: output of build_chunk_context_json(chunks)
     """
-    agent = Agent(
-        name="PO QA (Chunk-Cited)",
-        instructions=QA_INSTRUCTIONS,
-        model=model,
-        output_type=AnswerWithCitations,  # strict structured output
-    )
-
     prompt = (
         f"Question:\n{question}\n\n"
         "Below is the JSON array of chunks. Use them to answer and provide citations:\n\n"
         f"{chunks_json}"
     )
-
-    res = await Runner.run(agent, input=prompt)
-    return res.final_output
+    res = await PROVIDER.run_structured_text(
+        name="PO QA (Chunk-Cited)",
+        instructions=QA_INSTRUCTIONS,
+        model=model,
+        output_type=AnswerWithCitations,
+        input_text=prompt,
+    )
+    return res
 
 
 def _chunk_to_element_dict(ch: Chunk) -> Dict[str, Any]:

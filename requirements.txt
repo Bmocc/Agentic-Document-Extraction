@@ -1,0 +1,10 @@
+python-dotenv>=1.0.1
+pydantic>=2.5.0
+pdfplumber>=0.11.0
+pdf2image>=1.17.0
+Pillow>=10.0.0
+PyMuPDF>=1.24.0
+openai>=1.52.0
+# Agents SDK used in this repo. Depending on your setup this may be
+# `agents` or `openai-agents`. Keep `agents` here as used by the code.
+agents>=0.2.0
